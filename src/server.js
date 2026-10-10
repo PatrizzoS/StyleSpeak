@@ -2,7 +2,7 @@
 /**
  * stylespeak — MCP server + CLI
  *
- * MCP mode: exposes four tools:
+ * MCP mode: exposes five tools:
  *   resolve_styles  — what CSS applies to a selector, who wins, who loses
  *   trace_property  — every rule setting a property, competing groups, blast radius
  *   live_resolve    — exact resolution via Chrome DevTools Protocol
@@ -43,11 +43,11 @@ const TOOLS = [
         files: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Absolute paths to CSS/SCSS files to analyze.',
+          description: 'Absolute paths to CSS/SCSS files — or JS/TS files using styled-components / Emotion — to analyze.',
         },
         projectRoot: {
           type: 'string',
-          description: 'Optional: path to a project root. All CSS/SCSS files will be discovered recursively.',
+          description: 'Optional: path to a project root. All CSS/SCSS files — and JS/TS files that import styled-components or Emotion — are discovered recursively.',
         },
         componentFiles: {
           type: 'array',
@@ -75,11 +75,11 @@ const TOOLS = [
         files: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Absolute paths to CSS/SCSS files to analyze.',
+          description: 'Absolute paths to CSS/SCSS files — or JS/TS files using styled-components / Emotion — to analyze.',
         },
         projectRoot: {
           type: 'string',
-          description: 'Optional: path to a project root. All CSS/SCSS files will be discovered recursively.',
+          description: 'Optional: path to a project root. All CSS/SCSS files — and JS/TS files that import styled-components or Emotion — are discovered recursively.',
         },
       },
       required: ['property'],
@@ -139,11 +139,11 @@ const TOOLS = [
         files: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Absolute paths to CSS/SCSS files to analyze.',
+          description: 'Absolute paths to CSS/SCSS files — or JS/TS files using styled-components / Emotion — to analyze.',
         },
         projectRoot: {
           type: 'string',
-          description: 'Optional: path to a project root. All CSS/SCSS files will be discovered recursively.',
+          description: 'Optional: path to a project root. All CSS/SCSS files — and JS/TS files that import styled-components or Emotion — are discovered recursively.',
         },
       },
       required: ['selector', 'property'],
@@ -165,11 +165,11 @@ const TOOLS = [
         files: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Absolute paths to CSS/SCSS files to analyze.',
+          description: 'Absolute paths to CSS/SCSS files — or JS/TS files using styled-components / Emotion — to analyze.',
         },
         projectRoot: {
           type: 'string',
-          description: 'Path to project root. All CSS/SCSS files discovered recursively.',
+          description: 'Path to project root. All CSS/SCSS files — and JS/TS files that import styled-components or Emotion — are discovered recursively.',
         },
         maxSelectors: {
           type: 'number',
@@ -204,7 +204,7 @@ function handleRequest(req) {
       result: {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'stylespeak', version: '1.2.0' },
+        serverInfo: { name: 'stylespeak', version: '1.3.0' },
       },
     });
   }
@@ -283,7 +283,7 @@ function runCLI(args) {
     const maxSelectors = maxSelectorsIdx !== -1 ? parseInt(args[maxSelectorsIdx + 1]) : 200;
     result = styleManifest({ files: fileArgs, projectRoot, maxSelectors });
   } else {
-    console.error('Unknown command: ' + command + '. Use resolve, trace, or impact.');
+    console.error('Unknown command: ' + command + '. Use resolve, trace, impact, or manifest.');
     process.exit(1);
   }
 

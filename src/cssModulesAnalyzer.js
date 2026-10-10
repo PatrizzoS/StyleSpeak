@@ -73,7 +73,12 @@ function tagModuleRules(rules) {
  * actually conflict.
  */
 function shouldSuppressCrossModuleConflict(ruleA, ruleB) {
-  if (!ruleA.cssModule || !ruleB.cssModule) return false;
+  // CSS-in-JS components (styled-components / Emotion) get hashed class names at
+  // runtime, exactly like CSS Modules — same-named components in different files
+  // cannot conflict.
+  const bothModules = ruleA.cssModule && ruleB.cssModule;
+  const bothCssInJs = ruleA.cssInJs && ruleB.cssInJs;
+  if (!bothModules && !bothCssInJs) return false;
   if (!ruleA.localScope || !ruleB.localScope) return false;
   // Same module file — conflicts are real and should still be reported
   if (ruleA.source.file === ruleB.source.file) return false;

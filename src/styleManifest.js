@@ -24,7 +24,7 @@ const path = require('path');
 const { buildCSSOM, discoverStyleFiles, specificityToString } = require('./cssomBuilder');
 const { buildVariableSummary, enrichValue, containsVar } = require('./variableResolver');
 const { matchSelector } = require('./selectorMatcher');
-const { isCSSModule } = require('./cssModulesAnalyzer');
+const { isCSSModule, shouldSuppressCrossModuleConflict } = require('./cssModulesAnalyzer');
 
 // ─── Selector index builder ───────────────────────────────────────────────────
 
@@ -45,6 +45,9 @@ function buildSelectorIndex(rules) {
         properties: new Set(),
         cssModule: !!rule.cssModule,
         localScope: !!rule.localScope,
+        cssInJs: !!rule.cssInJs,
+        library: rule.library,
+        hasDynamicValues: false,
       });
     }
     const entry = index.get(sel);
@@ -57,6 +60,7 @@ function buildSelectorIndex(rules) {
     }
     // Merge module status
     if (rule.cssModule) entry.cssModule = true;
+    if (rule.hasDynamicValues) entry.hasDynamicValues = true;
   }
 
   return index;
@@ -95,7 +99,8 @@ function buildCompetitionMap(rules, selectorIndex) {
 
         if (confAB === 'none' && confBA === 'none') continue;
 
-        // Don't flag cross-module conflicts — they can't actually conflict
+        // Don't flag cross-module / cross-component conflicts — hashed class names can't actually conflict
+        if (shouldSuppressCrossModuleConflict(a, b) && a.source.file !== b.source.file) continue;
         if (a.cssModule && b.cssModule && a.source.file !== b.source.file) continue;
 
         if (!competitionMap.has(a.selector)) competitionMap.set(a.selector, new Set());
@@ -192,8 +197,9 @@ function identifyRiskHotspots(selectorIndex, competitionMap, rules) {
     // Many properties set (broad rule)
     if (info.properties.size > 8) { riskScore += 1; reasons.push(info.properties.size + ' properties set'); }
 
-    // Multiple source locations (same selector declared in multiple places)
-    if (info.sources.length > 1) { riskScore += 2; reasons.push('declared in ' + info.sources.length + ' locations'); }
+    // Multiple source locations (same selector declared in multiple places).
+    // Not a risk for CSS-in-JS: same-named components in different files are independently scoped.
+    if (info.sources.length > 1 && !info.cssInJs) { riskScore += 2; reasons.push('declared in ' + info.sources.length + ' locations'); }
 
     if (riskScore >= 2) {
       hotspots.push({
@@ -222,10 +228,12 @@ function buildFileSummary(rules, filePaths) {
     const basename = path.basename(filePath);
     const fileRules = rules.filter(r => r.source.file === filePath);
     const selectors = [...new Set(fileRules.map(r => r.selector))];
+    const fileIsCssInJs = fileRules.some(r => r.cssInJs);
     summary[basename] = {
       path: filePath,
       selectorCount: selectors.length,
       cssModule: isCSSModule(filePath),
+      cssInJs: fileIsCssInJs || undefined,
       selectors,
     };
   }
@@ -235,7 +243,7 @@ function buildFileSummary(rules, filePaths) {
 
 // ─── Agent guide generator ────────────────────────────────────────────────────
 
-function generateAgentGuide(meta, hotspots, variableCount) {
+function generateAgentGuide(meta, hotspots, variableCount, cssInJs) {
   const parts = [
     'This manifest summarises ' + meta.selectorCount + ' CSS selectors across ' +
     meta.fileCount + ' file(s). Use it as a reference at the start of a session.',
@@ -264,6 +272,20 @@ function generateAgentGuide(meta, hotspots, variableCount) {
   if (variableCount > 0) {
     parts.push('CSS VARIABLES: ' + variableCount + ' custom propert' + (variableCount === 1 ? 'y' : 'ies') +
       ' found. See "variables" for resolved values and usage.');
+  }
+
+  if (cssInJs) {
+    parts.push('CSS-IN-JS (' + cssInJs.libraries.join(', ') + '): ' + cssInJs.componentCount + ' component(s) across ' +
+      cssInJs.fileCount + ' file(s). Styled components are addressed by variable name as a class selector ' +
+      '(const Button = styled.button`` -> ".Button"). Values marked dynamic depend on props/theme and cannot be resolved statically.');
+    if (cssInJs.ambiguousComponents.length > 0) {
+      parts.push('  AMBIGUOUS NAMES: ' + cssInJs.ambiguousComponents.map(a => a.component + ' (' + a.files.join(', ') + ')').join('; ') +
+        ' — defined in more than one file; they are independent components, so results for these selectors mix files.');
+    }
+    if (cssInJs.skipped.length > 0) {
+      parts.push('  ' + cssInJs.skipped.length + ' style block(s) could not be statically extracted — see cssInJs.skipped.');
+    }
+    parts.push('');
   }
 
   parts.push('');
@@ -318,6 +340,8 @@ function styleManifest({ files = [], projectRoot = null, maxSelectors = 200 }) {
       overrideCount: competitors.length,
       cssModule: info.cssModule || undefined,
       localScope: info.localScope || undefined,
+      cssInJs: info.cssInJs || undefined,
+      hasDynamicValues: info.hasDynamicValues || undefined,
     };
   }
 
@@ -344,6 +368,7 @@ function styleManifest({ files = [], projectRoot = null, maxSelectors = 200 }) {
     variableCount: Object.keys(variableIndex).length,
     competitionGroupCount: [...competitionMap.values()].filter(s => s.size > 0).length / 2 | 0,
     cssModuleCount: filePaths.filter(f => isCSSModule(f)).length,
+    cssInJsFileCount: cssom.cssInJs ? cssom.cssInJs.fileCount : 0,
     hotspotCount: hotspots.length,
   };
 
@@ -354,7 +379,8 @@ function styleManifest({ files = [], projectRoot = null, maxSelectors = 200 }) {
     variables: variableIndex,
     riskHotspots: hotspots,
     files: fileSummary,
-    agentGuide: generateAgentGuide(meta, hotspots, meta.variableCount),
+    cssInJs: cssom.cssInJs || undefined,
+    agentGuide: generateAgentGuide(meta, hotspots, meta.variableCount, cssom.cssInJs),
     note: truncated
       ? 'Output limited to ' + maxSelectors + ' selectors (project has ' + selectorIndex.size + '). Increase maxSelectors or use projectRoot with a more specific path.'
       : undefined,

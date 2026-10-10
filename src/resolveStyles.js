@@ -80,6 +80,8 @@ function resolveStyles({ selector, files = [], projectRoot = null, componentFile
       winner: enriched.winner,
       overridden: enriched.overridden,
       confidence: lowestConfidence,
+      // value depends on runtime props/theme (styled-components / Emotion) — static answer may differ at runtime
+      ...(enriched.winner.dynamic ? { dynamic: true } : {}),
     };
   }
 
@@ -96,6 +98,30 @@ function resolveStyles({ selector, files = [], projectRoot = null, componentFile
   if (mediaWinners > 0) agentNoteParts.push(mediaWinners + ' propert' + (mediaWinners === 1 ? "y's" : "ies'") + ' winning value comes from a @media rule - only applies at that breakpoint.');
   if (varCount > 0) agentNoteParts.push(varCount + ' propert' + (varCount === 1 ? 'y uses' : 'ies use') + ' CSS custom properties - resolved values shown alongside raw var() references.');
 
+  // ── CSS-in-JS context (styled-components / Emotion) ──────────────────────────────────────
+  const matchedCssInJs = matchingRules.filter(r => r.cssInJs);
+  let cssInJsInfo;
+  if (matchedCssInJs.length > 0) {
+    const dynamicProperties = Object.entries(properties)
+      .filter(([, v]) => v.winner.dynamic || v.overridden.some(o => o.dynamic))
+      .map(([k]) => k);
+    const extendsList = [...new Set(matchedCssInJs.filter(r => r.extends).map(r => r.component + ' extends ' + r.extends))];
+    const droppedInterpolations = Math.max(0, ...matchedCssInJs.map(r => r.dynamicInterpolations || 0));
+    const components = [...new Set(matchedCssInJs.map(r => r.component))];
+    const ambiguous = ((cssom.cssInJs && cssom.cssInJs.ambiguousComponents) || [])
+      .filter(a => components.includes(a.component));
+
+    cssInJsInfo = { components, dynamicProperties, extends: extendsList, droppedInterpolations, ambiguousComponents: ambiguous };
+
+    agentNoteParts.push('Includes CSS-in-JS styles (' + [...new Set(matchedCssInJs.map(r => r.library))].join(', ') +
+      '); components are addressed by variable name (e.g. ".Button").');
+    if (dynamicProperties.length) agentNoteParts.push(dynamicProperties.length + ' propert' + (dynamicProperties.length === 1 ? 'y has a value that depends' : 'ies have values that depend') +
+      ' on props/theme at runtime (' + dynamicProperties.join(', ') + ') - shown as ${...}; the winner may differ depending on props.');
+    if (droppedInterpolations) agentNoteParts.push(droppedInterpolations + ' dynamic interpolation(s) (conditional blocks, mixin calls) could not be evaluated and are not reflected - additional styles may apply at runtime.');
+    if (extendsList.length) agentNoteParts.push(extendsList.join('; ') + ' - the base component\'s styles also apply and are not merged here; call resolve_styles on the base selector too.');
+    if (ambiguous.length) agentNoteParts.push('Component name(s) ' + ambiguous.map(a => a.component + ' (' + a.files.join(', ') + ')').join('; ') + ' are defined in more than one file - they are independent components, so results above mix them.');
+  }
+
   return {
     query: {
       selector,
@@ -104,6 +130,7 @@ function resolveStyles({ selector, files = [], projectRoot = null, componentFile
     },
     properties,
     variables: buildVariableSummary(variableMap, selector),
+    ...(cssInJsInfo ? { cssInJs: cssInJsInfo } : {}),
     matchedRules: matchingRules.length,
     summary: 'Found ' + Object.keys(properties).length + ' properties applying to "' + selector + '" from ' + matchingRules.length + ' matched rule(s) across ' + filePaths.length + ' file(s).',
     agentNote: agentNoteParts.join(' '),

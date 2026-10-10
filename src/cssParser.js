@@ -1,5 +1,5 @@
 /**
- * CSS Parser for stylescope.
+ * CSS Parser for stylespeak.
  * Improved over stylesafe's version with:
  *  - Line number tracking for every rule (for source location in output)
  *  - At-rule context preservation (@media, @layer, @supports)

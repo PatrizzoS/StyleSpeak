@@ -284,6 +284,184 @@ async function run() {
   const noFiles = styleManifest({});
   assert.ok(noFiles.error, 'should error when no files provided');
 
+  // ── CSS-in-JS (styled-components / Emotion) ──────────────────────────
+  const fs = require('fs');
+  const { extractCssInJs, detectLibrary, toKebabCase, findAmbiguousComponents } = require('../src/cssInJsExtractor');
+  const { discoverStyleFiles } = require('../src/cssomBuilder');
+
+  const styledFixture = path.join(__dirname, 'fixtures', 'styled.jsx');
+  const typedFixture = path.join(__dirname, 'fixtures', 'Typed.tsx');
+  const emotionFixture = path.join(__dirname, 'fixtures', 'emotion.js');
+  const plainJsFixture = path.join(__dirname, 'fixtures', 'not-css-in-js.js');
+
+  // library detection
+  assert.strictEqual(detectLibrary("import styled from 'styled-components';"), 'styled-components', 'detects styled-components');
+  assert.strictEqual(detectLibrary("import styled from '@emotion/styled';"), 'emotion', 'detects @emotion/styled');
+  assert.strictEqual(detectLibrary("import { css } from '@emotion/react';"), 'emotion', 'detects @emotion/react');
+  assert.strictEqual(detectLibrary("const css = x => x;"), null, 'no import means no CSS-in-JS');
+
+  // property-name conversion
+  assert.strictEqual(toKebabCase('backgroundColor'), 'background-color', 'camelCase -> kebab-case');
+  assert.strictEqual(toKebabCase('WebkitTransition'), '-webkit-transition', 'vendor prefix (Webkit)');
+  assert.strictEqual(toKebabCase('msTransform'), '-ms-transform', 'vendor prefix (ms)');
+  assert.strictEqual(toKebabCase('--my-var'), '--my-var', 'custom properties untouched');
+
+  // plain JS without a CSS-in-JS import is ignored
+  const plainExtract = extractCssInJs(fs.readFileSync(plainJsFixture, 'utf8'), plainJsFixture);
+  assert.strictEqual(plainExtract.rules.length, 0, 'file without a styled-components/Emotion import yields no rules');
+
+  // tagged-template extraction
+  const sc = extractCssInJs(fs.readFileSync(styledFixture, 'utf8'), styledFixture);
+  assert.strictEqual(sc.library, 'styled-components', 'library detected for styled.jsx');
+  // extractor output nests provenance under rule.meta (buildCSSOM flattens it) — flatten for convenience here
+  const scRule = sel => { const r = sc.rules.find(x => x.selectors.includes(sel) && !x.mediaContext); return r && { ...r, ...r.meta }; };
+  const scDecl = (sel, prop) => (scRule(sel) || { declarations: [] }).declarations.find(d => d.prop === prop);
+
+  assert.ok(scRule('.Button'), 'styled.button becomes .Button');
+  assert.ok(scRule('.Button:hover'), '&:hover nests under the component');
+  assert.ok(scRule('.Button:focus'), 'bare :focus attaches to the parent like styled-components does');
+  assert.ok(scRule('.Button.Button'), '&& doubles the class (specificity bump)');
+  assert.ok(scRule('.Button .Icon'), '${Icon} component selector becomes .Icon descendant');
+  assert.ok(sc.rules.find(r => r.selectors.includes('.Button') && r.mediaContext === '@media (min-width: 768px)'), '@media blocks are preserved');
+  assert.strictEqual(scDecl('.Button', 'background-color').value, '#2563eb', 'same-file object constant resolved (colors.primary)');
+  assert.strictEqual(scDecl('.Button', 'display').value, 'flex', 'css`` helper mixin is inlined');
+  assert.strictEqual(scDecl('.Icon', 'color').value, '#2563eb', 'same-file string constant resolved (BRAND)');
+  assert.ok(!scDecl('.Button', 'color').value.includes('#'), 'prop-dependent value is not guessed');
+  assert.strictEqual(scDecl('.Button', 'color').dynamic, true, 'prop-dependent value flagged dynamic');
+  assert.ok(scRule('.Button').dynamicInterpolations >= 1, 'dropped conditional block is counted');
+  assert.strictEqual(scRule('.PrimaryButton').extends, 'Button', 'styled(Base) records extends');
+  assert.strictEqual(scRule('.Wrapper').tag, 'div', '.attrs() chain still extracts the component');
+  assert.ok(scRule('body') && scRule('body').kind === 'global' && scRule('body').localScope === false, 'createGlobalStyle rules keep real selectors and are not locally scoped');
+  assert.ok(!sc.rules.some(r => r.selectors.some(s => s.includes('fade'))), 'keyframes are not emitted as rules');
+  assert.ok(sc.skipped.some(s => /css prop/i.test(s.reason)), 'anonymous Emotion css prop is reported as skipped');
+  assert.ok(sc.rules.every(r => r.source.file === styledFixture && r.source.line > 0), 'rules carry file + line');
+
+  // TypeScript generics
+  const ts = extractCssInJs(fs.readFileSync(typedFixture, 'utf8'), typedFixture);
+  assert.ok(ts.rules.find(r => r.selectors.includes('.Tab')), 'styled.button<Props>`` (TS generics) extracts');
+  assert.strictEqual(ts.rules.find(r => r.selectors.includes('.Tab')).declarations.find(d => d.prop === 'color').dynamic, true, 'destructured prop function is dynamic');
+
+  // object syntax
+  const em = extractCssInJs(fs.readFileSync(emotionFixture, 'utf8'), emotionFixture);
+  assert.strictEqual(em.library, 'emotion', 'library detected for emotion.js');
+  const emRule = (sel, media) => em.rules.find(r => r.selectors.includes(sel) && (media ? r.mediaContext === media : !r.mediaContext));
+  const emDecl = (sel, prop, media) => (emRule(sel, media) || { declarations: [] }).declarations.find(d => d.prop === prop);
+
+  assert.strictEqual(emDecl('.Panel', 'padding').value, '16px', 'unitless number gets px');
+  assert.strictEqual(emDecl('.Panel', 'opacity').value, '0.9', 'unitless property keeps bare number');
+  assert.strictEqual(emDecl('.Panel', 'z-index').value, '10', 'z-index stays unitless');
+  assert.strictEqual(emDecl('.Panel', 'line-height').value, '1.5', 'line-height stays unitless');
+  assert.strictEqual(emDecl('.Panel', 'border-radius').value, '6px', 'same-file object constant resolved (theme.radius)');
+  assert.ok(emDecl('.Panel', '-webkit-transition'), 'WebkitTransition -> -webkit-transition');
+  assert.ok(emDecl('.Panel', '-ms-transform'), 'msTransform -> -ms-transform');
+  assert.ok(emDecl('.Panel', '--panel-bg'), 'custom property keys preserved');
+  assert.strictEqual(emDecl('.Panel', 'box-sizing').value, 'border-box', 'spread of a css({}) helper is inlined');
+  assert.strictEqual(emDecl('.Panel', 'color').dynamic, true, 'non-literal object value flagged dynamic');
+  assert.ok(emRule('.Panel:hover'), "'&:hover' key nests");
+  assert.ok(emRule('.Panel:focus'), "':focus' key attaches to the parent");
+  assert.ok(emRule('.Panel .title'), "'.title' key nests as descendant");
+  assert.strictEqual(emDecl('.Panel', 'padding', '@media (min-width: 600px)').value, '12px', 'numeric constant in object syntax gets px inside @media');
+  assert.ok(emRule('.Heading'), "styled('h2')(props => ({...})) extracts");
+  assert.strictEqual(emDecl('.Heading', 'font-size').value, '24px', 'static value inside a function-returned object is certain');
+  assert.strictEqual(emDecl('.Heading', 'color').dynamic, true, 'prop-dependent value inside function-returned object is dynamic');
+  assert.ok(emRule('.buttonStyles'), 'named css`` for the Emotion css prop is addressable');
+
+  // edge cases (inline sources)
+  const inlineSrc = src => extractCssInJs("import styled, { css } from 'styled-components';\n" + src, 'inline.js');
+
+  const mqResolved = inlineSrc("const bp = { md: '(min-width: 768px)' };\nconst I = styled.div`\n  @media ${bp.md} { color: red; }\n`;");
+  assert.strictEqual(mqResolved.rules[0].mediaContext, '@media (min-width: 768px)', '@media ${const} resolves from a same-file constant');
+
+  const mqDynamic = inlineSrc("const I = styled.div`\n  @media ${props => props.mq} { color: red; }\n`;");
+  assert.ok(mqDynamic.rules[0].mediaContext.includes('${'), 'unresolvable @media interpolation is preserved as ${...}, not guessed');
+
+  const multiLine = inlineSrc("const H = styled\n  .div`color: red;`;");
+  assert.ok(multiLine.rules.find(r => r.selectors.includes('.H')), 'styled chain split across lines still extracts');
+
+  const multiSel = inlineSrc("const Icon = styled.i``;\nconst Link = styled.a``;\nconst C = styled.div`\n  ${Icon}, ${Link} { color: red; }\n  ${Link}:hover & { color: green; }\n`;");
+  assert.ok(multiSel.rules.find(r => r.selectors.join(',') === '.C .Icon,.C .Link'), 'comma-separated component selectors expand');
+  assert.ok(multiSel.rules.find(r => r.selectors.includes('.Link:hover .C')), '${Link}:hover & places the component before the parent');
+
+  const nestedTpl = inlineSrc("const A = styled.div`\n  color: red;\n  ${p => p.x && css`\n    background: ${p.bg};\n    &:hover { color: ${`blue`}; }\n  `}\n  margin: 0;\n`;");
+  assert.strictEqual(nestedTpl.rules.length, 1, 'nested template inside an interpolation does not break extraction');
+  assert.deepStrictEqual(nestedTpl.rules[0].declarations.map(d => d.prop), ['color', 'margin'], 'static declarations around a dropped conditional block survive');
+
+  const urlComments = inlineSrc("const B = styled.div`\n  background: url(//cdn.example.com/a.png);\n  // comment with { brace\n  width: calc(100% - ${8}px);\n`;");
+  assert.strictEqual(urlComments.rules[0].declarations.find(d => d.prop === 'background').value, 'url(//cdn.example.com/a.png)', '// inside url() is not treated as a comment');
+  assert.strictEqual(urlComments.rules[0].declarations.find(d => d.prop === 'width').value, 'calc(100% - 8px)', 'literal interpolation inlined');
+
+  const strFalsePositive = inlineSrc("const cssText = 'css`not real`';\nfunction styledThing() { return 1 }");
+  assert.strictEqual(strFalsePositive.skipped.length, 0, 'css` inside a string literal is not reported as skipped');
+
+  assert.doesNotThrow(() => inlineSrc("const D = styled.div`\n  color: red;\n  ${oops"), 'unterminated template does not throw');
+  assert.doesNotThrow(() => inlineSrc("const E = styled.div({\n  color: 'red',\n  '&:hover': {"), 'unterminated object does not throw');
+
+  // performance guard — line lookup must not be quadratic
+  let bigSrc = "import styled from 'styled-components';\n";
+  for (let i = 0; i < 1500; i++) bigSrc += 'const C' + i + ' = styled.div`\n  color: red;\n  &:hover { color: blue; }\n`;\n';
+  const bigStart = Date.now();
+  const bigResult = extractCssInJs(bigSrc, 'big.js');
+  assert.strictEqual(bigResult.rules.length, 3000, 'large file extracts every rule');
+  assert.ok(Date.now() - bigStart < 5000, 'large file extracts in a reasonable time');
+
+  // same component name in two files is reported as ambiguous
+  const ambiguous = findAmbiguousComponents(
+    [...sc.rules, ...ts.rules].flatMap(r => r.selectors.map(s => ({ ...r.meta, selector: s, source: r.source })))
+  );
+  assert.ok(ambiguous.some(a => a.component === 'Wrapper'), 'Wrapper defined in two files is flagged ambiguous');
+
+  // discovery: projectRoot finds JS/TS files that import a CSS-in-JS library, and only those
+  const discovered = discoverStyleFiles(path.join(__dirname, 'fixtures')).map(f => path.basename(f));
+  assert.ok(discovered.includes('styled.jsx') && discovered.includes('Typed.tsx') && discovered.includes('emotion.js'), 'discovery includes CSS-in-JS files');
+  assert.ok(!discovered.includes('not-css-in-js.js'), 'discovery skips JS files with no CSS-in-JS import');
+
+  // buildCSSOM: CSS-in-JS flows through the shared cascade model
+  const cssInJsCSSOM = buildCSSOM([styledFixture, typedFixture]);
+  assert.ok(cssInJsCSSOM.cssInJs && cssInJsCSSOM.cssInJs.fileCount === 2, 'cssom reports CSS-in-JS file count');
+  assert.ok(cssInJsCSSOM.cssInJs.ambiguousComponents.some(a => a.component === 'Wrapper'), 'cssom reports ambiguous component names');
+  const cssomButton = cssInJsCSSOM.rules.find(r => r.selector === '.Button');
+  assert.ok(cssomButton.cssInJs === true && cssomButton.localScope === true, 'cssom rules carry CSS-in-JS metadata');
+  assert.deepStrictEqual(cssomButton.specificity, [0, 0, 1, 0], 'styled component has single-class specificity');
+  assert.deepStrictEqual(cssInJsCSSOM.rules.find(r => r.selector === '.Button.Button').specificity, [0, 0, 2, 0], '&& raises specificity');
+  assert.ok(shouldSuppressCrossModuleConflict(
+    cssInJsCSSOM.rules.find(r => r.selector === '.Wrapper' && r.source.file === styledFixture),
+    cssInJsCSSOM.rules.find(r => r.selector === '.Wrapper' && r.source.file === typedFixture)
+  ), 'same-named components in different files do not conflict');
+
+  // resolve_styles on a styled component
+  const scResolved = resolveStyles({ selector: '.Button', files: [styledFixture] });
+  assert.ok(!scResolved.error, 'resolve_styles should work on CSS-in-JS files');
+  assert.strictEqual(scResolved.properties['background-color'].winner.cssInJs, true, 'winner carries CSS-in-JS provenance');
+  assert.strictEqual(scResolved.properties['background-color'].winner.component, 'Button', 'winner names its component');
+  assert.strictEqual(scResolved.properties['color'].dynamic, true, 'dynamic property is flagged at property level');
+  assert.ok(scResolved.cssInJs && scResolved.cssInJs.dynamicProperties.includes('color'), 'cssInJs summary lists dynamic properties');
+  assert.ok(/props\/theme/.test(scResolved.agentNote), 'agentNote warns about runtime-dependent values');
+  const iconResolved = resolveStyles({ selector: '.Icon', files: [styledFixture] });
+  assert.ok(iconResolved.properties['margin-right'], 'component-selector rule (${Icon}) applies to .Icon via ancestor rule');
+  assert.strictEqual(iconResolved.properties['margin-right'].confidence, 'possible', 'ancestor rule is possible, not certain');
+  const extResolved = resolveStyles({ selector: '.PrimaryButton', files: [styledFixture] });
+  assert.ok(/extends Button/.test(extResolved.agentNote), 'agentNote points at the base component for styled(Base)');
+
+  // trace_property across CSS and CSS-in-JS together
+  const mixedTrace = traceProperty({ property: 'color', files: [styledFixture, path.join(__dirname, 'fixtures', 'buttons.css')] });
+  assert.ok(mixedTrace.occurrences.some(o => o.cssInJs && o.component === 'Icon'), 'trace_property includes CSS-in-JS occurrences');
+  assert.ok(mixedTrace.occurrences.some(o => o.dynamic), 'trace_property flags dynamic occurrences');
+
+  // impact_preview on a styled component
+  const scImpact = impactPreview({ selector: '.Button', property: 'background-color', newValue: '#ff0000', files: [styledFixture] });
+  assert.ok(!scImpact.error, 'impact_preview should work on CSS-in-JS');
+  assert.ok(scImpact.impacts.find(i => i.type === 'value-change' && i.affectedSelector === '.Button'), 'impact_preview reports the direct change on a styled component');
+
+  // style_manifest with CSS-in-JS
+  const scManifest = styleManifest({ files: [styledFixture, typedFixture, emotionFixture] });
+  assert.ok(scManifest.cssInJs && scManifest.cssInJs.componentCount > 0, 'manifest includes cssInJs summary');
+  assert.ok(scManifest.cssInJs.skipped.length > 0, 'manifest surfaces skipped (non-extractable) blocks');
+  assert.ok(scManifest.selectors['.Button'].cssInJs === true, 'manifest tags CSS-in-JS selectors');
+  assert.ok(scManifest.selectors['.Button'].hasDynamicValues === true, 'manifest flags selectors with dynamic values');
+  assert.ok(!scManifest.riskHotspots.some(h => h.selector === '.Wrapper' && h.reasons.some(r => /locations/.test(r))), 'same-named components are not a "declared in N locations" hotspot');
+  assert.ok(/CSS-IN-JS/.test(scManifest.agentGuide), 'agentGuide explains CSS-in-JS addressing');
+  assert.ok(scManifest.meta.cssInJsFileCount === 3, 'meta reports CSS-in-JS file count');
+
   console.log('stylespeak regression checks passed');
 }
 

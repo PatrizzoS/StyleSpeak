@@ -19,20 +19,39 @@ const { calculateSpecificity, compareSpecificity, specificityToString } = requir
 const { buildVariableMap, enrichValue, buildVariableSummary } = require('./variableResolver');
 const { tagModuleRules, shouldSuppressCrossModuleConflict, enrichWithModuleInfo } = require('./cssModulesAnalyzer');
 const { buildComponentGraph, discoverComponentFiles } = require('./astComponentGraph');
+const { isCssInJsFile, detectLibrary, extractCssInJs, findAmbiguousComponents } = require('./cssInJsExtractor');
 
 const STYLE_EXTENSIONS = new Set(['.css', '.scss']);
 
 function buildCSSOM(filePaths) {
   const flatRules = [];
+  const cssInJsFiles = [];
+  const cssInJsSkipped = [];
+  const cssInJsLibraries = new Set();
+  let cssInJsComponentCount = 0;
   let sourceOrder = 0;
 
   for (const filePath of filePaths) {
     if (!fs.existsSync(filePath)) continue;
     const ext = path.extname(filePath).toLowerCase();
-    if (!STYLE_EXTENSIONS.has(ext)) continue;
+    const isStyleFile = STYLE_EXTENSIONS.has(ext);
+    const isJsFile = !isStyleFile && isCssInJsFile(filePath);
+    if (!isStyleFile && !isJsFile) continue;
 
-    const cssText = fs.readFileSync(filePath, 'utf8');
-    const rules = parseFile(cssText, filePath);
+    const text = fs.readFileSync(filePath, 'utf8');
+    let rules;
+    if (isJsFile) {
+      // styled-components / Emotion — extracted statically, then flows through the same cascade engine
+      const extracted = extractCssInJs(text, filePath);
+      if (!extracted.library) continue; // plain JS/TS file with no CSS-in-JS import
+      rules = extracted.rules;
+      cssInJsFiles.push(filePath);
+      cssInJsLibraries.add(extracted.library);
+      cssInJsComponentCount += extracted.componentCount;
+      for (const s of extracted.skipped) cssInJsSkipped.push({ file: path.basename(filePath), ...s });
+    } else {
+      rules = parseFile(text, filePath);
+    }
 
     for (const rule of rules) {
       for (const selector of rule.selectors) {
@@ -43,6 +62,7 @@ function buildCSSOM(filePaths) {
           mediaContext: rule.mediaContext,
           specificity: calculateSpecificity(selector),
           sourceOrder: sourceOrder++,
+          ...(rule.meta || {}),
         });
       }
     }
@@ -50,11 +70,19 @@ function buildCSSOM(filePaths) {
 
   const taggedRules = tagModuleRules(flatRules);
   const variableMap = buildVariableMap(taggedRules);
-  return { rules: taggedRules, fileCount: filePaths.length, variableMap };
+  const cssInJs = cssInJsFiles.length === 0 ? null : {
+    fileCount: cssInJsFiles.length,
+    libraries: [...cssInJsLibraries],
+    componentCount: cssInJsComponentCount,
+    ambiguousComponents: findAmbiguousComponents(taggedRules),
+    skipped: cssInJsSkipped,
+  };
+  return { rules: taggedRules, fileCount: filePaths.length, variableMap, cssInJs };
 }
 
 /**
- * Discovers all CSS/SCSS files under a directory recursively.
+ * Discovers all CSS/SCSS files under a directory recursively, plus any JS/TS
+ * files that import styled-components or Emotion (their styles live in JS).
  */
 function discoverStyleFiles(dir) {
   const results = [];
@@ -70,6 +98,10 @@ function discoverStyleFiles(dir) {
         }
       } else if (STYLE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
         results.push(fullPath);
+      } else if (isCssInJsFile(fullPath)) {
+        try {
+          if (detectLibrary(fs.readFileSync(fullPath, 'utf8'))) results.push(fullPath);
+        } catch { /* unreadable file — skip */ }
       }
     }
   }
@@ -115,6 +147,13 @@ function resolveCascade(matchingRules, prop) {
 
   const [winning, ...losing] = withDecl;
 
+  // CSS-in-JS provenance: which library/component a rule came from, and whether
+  // its value depends on runtime props/theme (so the static answer may differ at runtime).
+  const origin = (rule, decl) => ({
+    ...(rule.cssInJs ? { cssInJs: true, library: rule.library, component: rule.component } : {}),
+    ...(decl.dynamic ? { dynamic: true } : {}),
+  });
+
   return {
     winner: {
       value: winning.decl.value,
@@ -123,6 +162,7 @@ function resolveCascade(matchingRules, prop) {
       specificity: specificityToString(winning.rule.specificity),
       source: winning.rule.source,
       mediaContext: winning.rule.mediaContext,
+      ...origin(winning.rule, winning.decl),
     },
     overridden: losing.map(({ rule, decl }) => ({
       value: decl.value,
@@ -131,6 +171,7 @@ function resolveCascade(matchingRules, prop) {
       specificity: specificityToString(rule.specificity),
       source: rule.source,
       mediaContext: rule.mediaContext,
+      ...origin(rule, decl),
       reason: losing.length > 0
         ? decl.important && !winning.decl.important ? 'overridden by !important'
           : compareSpecificity(rule.specificity, winning.rule.specificity) < 0 ? 'lower specificity'

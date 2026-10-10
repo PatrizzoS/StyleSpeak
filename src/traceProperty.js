@@ -87,6 +87,8 @@ function traceProperty({ property, files = [], projectRoot = null }) {
       specificity: specificityToString(rule.specificity),
       source: rule.source,
       mediaContext: rule.mediaContext || null,
+      ...(rule.cssInJs ? { cssInJs: true, library: rule.library, component: rule.component } : {}),
+      ...(decl.dynamic ? { dynamic: true } : {}),
     };
   });
 

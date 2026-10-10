@@ -28,6 +28,8 @@ Builds a compressed, structured summary of a project's entire CSS knowledge — 
 
 Queries a running Chromium browser via CDP and returns exact computed styles and matched rules. No heuristics, no confidence levels — the browser resolved it. Requires Chrome running with `--remote-debugging-port=9222`.
 
+**Works on more than plain CSS.** The four static tools above analyze `.css`, `.scss`, CSS Modules, and — as of v1.3 — [styled-components and Emotion](#css-in-js-support-styled-components--emotion) source files (`.js` / `.jsx` / `.ts` / `.tsx`), all through the same cascade engine.
+
 ## Quick start
 
 ### As a CLI tool
@@ -41,6 +43,10 @@ stylespeak resolve ".btn.primary" src/styles/main.css
 stylespeak trace "color" --projectRoot src/styles
 stylespeak impact ".btn" "background-color" src/styles/main.css --newValue "#ff0000"
 stylespeak manifest --projectRoot src/styles
+
+# styled-components / Emotion — components are addressed by variable name (const Button = styled.button`` -> .Button)
+stylespeak resolve ".Button" src/components/Button.jsx
+stylespeak manifest --projectRoot src
 ```
 
 ### As an MCP server
@@ -156,6 +162,71 @@ As of v0.2, stylespeak fully resolves CSS custom properties (`var()`) in all out
 
 Supported: simple, fallback, nested fallback, chained, scoped, media-context, circular reference protection.
 
+## CSS-in-JS support (styled-components & Emotion)
+
+As of v1.3, stylespeak statically extracts styles from `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs` and `.cjs` files that import `styled-components`, `@emotion/styled`, `@emotion/react` or `@emotion/css`, and runs them through the same cascade engine as plain CSS. `resolve_styles`, `trace_property`, `impact_preview` and `style_manifest` all work on them, and CSS-in-JS and regular CSS can be analyzed together.
+
+Pass JS/TS files in `files`, or point `projectRoot` at a directory — files that import one of these libraries are discovered automatically and all other JS/TS files are ignored.
+
+### Addressing components
+
+Generated class names are hashed at runtime, so each styled component is addressed by its **variable name as a class selector**:
+
+```js
+const Button = styled.button`...`;    // -> .Button
+export default styled.section`...`;   // -> .Card  (named after the file, e.g. Card.jsx)
+```
+
+Rules are tagged `cssInJs`, `library` and `component`, and are treated as locally scoped (like CSS Modules): two components named `Wrapper` in different files are independent, never reported as conflicting, and never counted as a "declared in N locations" risk. Querying such a name is flagged as ambiguous, because results will mix both files.
+
+### What is extracted
+
+| Syntax | Handling |
+|---|---|
+| Tagged templates | `` styled.div`…` ``, `` styled(Comp)`…` ``, `` styled.div.attrs(…)`…` ``, `` styled.div<Props>`…` `` (TypeScript generics), `` css`…` `` |
+| Object syntax | `styled.div({ … })`, `styled(Comp)({ … })`, `css({ … })`, `styled.div(props => ({ … }))` |
+| Global styles | `createGlobalStyle` / `injectGlobal` — real selectors, not locally scoped |
+| Nesting | `&`, `&&` (specificity bump), `&:hover`, bare `:hover`, nested selectors, `@media` / `@supports` / `@container` |
+| Component selectors | `${Icon} { … }` becomes `.Icon`, e.g. `.Button .Icon` |
+| Constants | Same-file `const` strings, numbers and object paths: `${SPACING}`, `${colors.primary}`, `@media ${bp.md}` |
+| `css` helpers | Same-file `` const mixin = css`…` `` is inlined where interpolated (`${mixin}`, `...mixin`) and is also queryable by its own name (tagged `css-helper`) — useful because Emotion's `css={mixin}` prop makes the helper the only visible record of those styles |
+| Object notation | camelCase becomes kebab-case, vendor prefixes (`WebkitX` → `-webkit-x`, `msX` → `-ms-x`), unitless numbers get `px` (except unitless properties like `opacity`, `z-index`, `line-height`) |
+
+### What is flagged, never guessed
+
+Values that depend on props or theme can't be known statically. stylespeak keeps the original expression, marks it, and tells the agent:
+
+```json
+"color": {
+  "winner": {
+    "value": "${props => props.color}",
+    "selector": ".Button",
+    "cssInJs": true,
+    "library": "styled-components",
+    "component": "Button",
+    "dynamic": true
+  },
+  "confidence": "certain",
+  "dynamic": true
+}
+```
+
+- `dynamic: true` on a declaration, winner and property means the value depends on runtime props/theme — the winner may differ depending on props.
+- Conditional blocks and mixin calls (`${p => p.active && css`…`}`) can't be evaluated. They are dropped and counted in `dynamicInterpolations`, and `agentNote` warns that additional styles may apply at runtime.
+- Style blocks that can't be attached to a selector are listed in `cssInJs.skipped` in `style_manifest` output instead of being silently ignored.
+- `styled(Base)` records `extends`; `agentNote` tells the agent to also resolve the base component.
+
+### Limitations
+
+This is static analysis, so there are boundaries:
+
+- `styled(Base)` does not merge the base component's styles into the child — resolve the base selector separately.
+- Constants and theme objects imported from other files are not resolved (same-file only). `ThemeProvider` themes are not resolved.
+- Emotion's `css` prop on JSX elements and style blocks not assigned to a named variable are anonymous — there is no selector to target, so they are reported as skipped.
+- `keyframes` are not modeled, and `.attrs({ className })` is not considered.
+- Cross-file injection order is approximated by the order files are provided.
+- For ground truth on a running app, use `live_resolve` against the real element.
+
 ## How it pairs with stylesafe
 
 **stylesafe** catches problems in your CSS — conflicts, dead rules, Tailwind clashes — before they ship.
@@ -189,8 +260,9 @@ google-chrome --remote-debugging-port=9222
 | `.scss` | Full — nesting, `&` references, `@media` passthrough |
 | `.module.css` / `.module.scss` | Full — locally scoped classes detected and tagged |
 | vanilla-extract / Linaria / StyleX | Supported via compiled CSS output |
-| styled-components / Emotion | Not supported — dynamic runtime styles |
-| CSS-in-JS object syntax | Not supported (post v1.0 roadmap) |
+| styled-components / Emotion | Supported (v1.3) — static extraction from `.js` / `.jsx` / `.ts` / `.tsx` / `.mjs` / `.cjs`; props/theme-dependent values are flagged `dynamic`, not guessed |
+| CSS-in-JS object syntax | Supported (v1.3) — `styled.div({…})`, `css({…})`, function-returned objects |
+| Emotion `css` prop (inline JSX) | Not extractable — anonymous, reported as skipped |
 
 ## Architecture
 
@@ -198,11 +270,12 @@ google-chrome --remote-debugging-port=9222
 src/
   cssParser.js            — CSS tokenizer with SCSS nesting support
   specificity.js          — standard (id, class, type) specificity calculator
-  cssomBuilder.js         — in-memory cascade model builder
+  cssomBuilder.js         — in-memory cascade model builder (CSS, SCSS, CSS Modules, CSS-in-JS)
   selectorMatcher.js      — heuristic selector matching with confidence levels
   variableResolver.js     — CSS custom property resolution
   cssModulesAnalyzer.js   — CSS Modules local scope detection
   scssNestingExpander.js  — SCSS nesting pre-processor
+  cssInJsExtractor.js     — styled-components / Emotion static extractor (template + object syntax)
   astComponentGraph.js    — AST component graph for graph-aware matching
   resolveStyles.js        — resolve_styles tool
   traceProperty.js        — trace_property tool
@@ -222,3 +295,8 @@ Zero external dependencies. Requires Node.js 21+.
 - **v1.0** ✅ — Chrome DevTools Protocol live resolution
 - **v1.1** ✅ — impact_preview: blast radius prediction before making a change
 - **v1.2** ✅ — style_manifest: compressed project-wide CSS knowledge for agent context
+- **v1.3** ✅ — CSS-in-JS: static extraction for styled-components and Emotion (template and object syntax)
+
+### Next (not yet scheduled)
+
+Known gaps in CSS-in-JS support, in no particular order: merging `styled(Base)` styles into the child, resolving constants and theme objects imported from other files, and modeling `keyframes` and the Emotion `css` prop.
